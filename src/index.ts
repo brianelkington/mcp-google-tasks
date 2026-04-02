@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+/**
+ * Extended Google Tasks MCP server (fork overlay for r/mcp).
+ * Adds optional `due` on create_task and `update_task` (patch title / notes / due).
+ * Base: mstfe/mcp-google-tasks; RFC 3339 for `due` (e.g. 2026-04-15T00:00:00.000Z).
+ */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -20,7 +25,7 @@ const GOOGLE_TASKS_API_VERSION = "v1";
 const oAuth2Client = new OAuth2(
   process.env.CLIENT_ID,
   process.env.CLIENT_SECRET,
-  process.env.REDIRECT_URI
+  process.env.REDIRECT_URI,
 );
 
 oAuth2Client.setCredentials({
@@ -34,24 +39,47 @@ const tasks = google.tasks({
 });
 
 interface CreateTaskArgs {
-  title: string;
+  title?: string;
   notes?: string;
+  due?: string;
   taskId?: string;
   status?: string;
 }
 
-// Type guard for CreateTaskArgs
-export function isValidCreateTaskArgs(args: any): args is CreateTaskArgs {
+export function isValidCreateTaskArgs(args: unknown): args is CreateTaskArgs {
   return (
     typeof args === "object" &&
     args !== null &&
-    (args.title === undefined || typeof args.title === "string") &&
-    (args.notes === undefined || typeof args.notes === "string") &&
-    (args.taskId === undefined || typeof args.taskId === "string") &&
-    (args.status === undefined || typeof args.status === "string")
+    ((args as CreateTaskArgs).title === undefined ||
+      typeof (args as CreateTaskArgs).title === "string") &&
+    ((args as CreateTaskArgs).notes === undefined ||
+      typeof (args as CreateTaskArgs).notes === "string") &&
+    ((args as CreateTaskArgs).due === undefined ||
+      typeof (args as CreateTaskArgs).due === "string") &&
+    ((args as CreateTaskArgs).taskId === undefined ||
+      typeof (args as CreateTaskArgs).taskId === "string") &&
+    ((args as CreateTaskArgs).status === undefined ||
+      typeof (args as CreateTaskArgs).status === "string")
   );
 }
 
+interface UpdateTaskArgs {
+  taskId: string;
+  title?: string;
+  notes?: string;
+  due?: string;
+}
+
+function isValidUpdateTaskArgs(args: unknown): args is UpdateTaskArgs {
+  if (typeof args !== "object" || args === null) return false;
+  const a = args as UpdateTaskArgs;
+  return (
+    typeof a.taskId === "string" &&
+    (a.title === undefined || typeof a.title === "string") &&
+    (a.notes === undefined || typeof a.notes === "string") &&
+    (a.due === undefined || typeof a.due === "string")
+  );
+}
 
 class TasksServer {
   private server: Server;
@@ -60,14 +88,14 @@ class TasksServer {
     this.server = new Server(
       {
         name: "google-tasks-server",
-        version: "1.0.0",
+        version: "1.1.0",
       },
       {
         capabilities: {
           resources: {},
           tools: {},
         },
-      }
+      },
     );
 
     this.setupHandlers();
@@ -108,7 +136,7 @@ class TasksServer {
         if (request.params.uri !== "tasks://default") {
           throw new McpError(
             ErrorCode.InvalidRequest,
-            `Unknown resource: ${request.params.uri}`
+            `Unknown resource: ${request.params.uri}`,
           );
         }
 
@@ -129,10 +157,10 @@ class TasksServer {
         } catch (error) {
           throw new McpError(
             ErrorCode.InternalError,
-            `Tasks API error: ${error}`
+            `Tasks API error: ${error}`,
           );
         }
-      }
+      },
     );
   }
 
@@ -141,12 +169,18 @@ class TasksServer {
       tools: [
         {
           name: "create_task",
-          description: "Create a new task in Google Tasks",
+          description:
+            "Create a new task in Google Tasks (optional due date as RFC 3339, e.g. 2026-04-15T00:00:00.000Z)",
           inputSchema: {
             type: "object",
             properties: {
               title: { type: "string", description: "Title of the task" },
               notes: { type: "string", description: "Notes for the task" },
+              due: {
+                type: "string",
+                description:
+                  "Due datetime (RFC 3339), e.g. 2026-04-15T00:00:00.000Z for end-of-day UTC",
+              },
             },
             required: ["title"],
           },
@@ -176,22 +210,46 @@ class TasksServer {
           inputSchema: {
             type: "object",
             properties: {
-              taskId: { type: "string", description: "ID of the task to toggle completion status" },
-              status: { type: "string", description: "Status of task, needsAction or completed" },
+              taskId: {
+                type: "string",
+                description: "ID of the task to toggle completion status",
+              },
+              status: {
+                type: "string",
+                description: "Status of task, needsAction or completed",
+              },
+            },
+            required: ["taskId"],
+          },
+        },
+        {
+          name: "update_task",
+          description:
+            "Update an existing task (patch). Provide taskId and at least one of title, notes, due (RFC 3339).",
+          inputSchema: {
+            type: "object",
+            properties: {
+              taskId: { type: "string", description: "ID of the task to update" },
+              title: { type: "string", description: "New title" },
+              notes: { type: "string", description: "New notes" },
+              due: {
+                type: "string",
+                description: "New due datetime (RFC 3339)",
+              },
             },
             required: ["taskId"],
           },
         },
       ],
     }));
-    
+
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (request.params.name === "list_tasks") {
         try {
           const response = await tasks.tasks.list({
             tasklist: "@default",
           });
-    
+
           return {
             content: [
               {
@@ -203,29 +261,44 @@ class TasksServer {
         } catch (error) {
           throw new McpError(
             ErrorCode.InternalError,
-            `Tasks API error: ${error}`
+            `Tasks API error: ${error}`,
           );
         }
       }
-    
+
       if (request.params.name === "create_task") {
         if (!isValidCreateTaskArgs(request.params.arguments)) {
           throw new McpError(
             ErrorCode.InvalidParams,
-            "Invalid arguments for creating a task. 'title' must be a string, and 'notes' must be a string or undefined."
+            "Invalid arguments for create_task: title (string) required; notes and due optional strings.",
           );
         }
         const args = request.params.arguments;
-    
+        if (typeof args.title !== "string" || args.title === "") {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "create_task requires a non-empty title string.",
+          );
+        }
+
         try {
+          const requestBody: {
+            title: string;
+            notes?: string;
+            due?: string;
+          } = {
+            title: args.title,
+          };
+          if (args.notes !== undefined) requestBody.notes = args.notes;
+          if (args.due !== undefined && args.due !== "") {
+            requestBody.due = args.due;
+          }
+
           const response = await tasks.tasks.insert({
             tasklist: "@default",
-            requestBody: {
-              title: args.title,
-              notes: args.notes,
-            },
+            requestBody,
           });
-    
+
           return {
             content: [
               {
@@ -237,7 +310,7 @@ class TasksServer {
         } catch (error) {
           throw new McpError(
             ErrorCode.InternalError,
-            `Tasks API error: ${error}`
+            `Tasks API error: ${error}`,
           );
         }
       }
@@ -246,15 +319,15 @@ class TasksServer {
         if (!isValidCreateTaskArgs(request.params.arguments)) {
           throw new McpError(
             ErrorCode.InvalidParams,
-            "Invalid arguments for creating a task. 'title' must be a string, and 'notes' must be a string or undefined."
+            "Invalid arguments for delete_task.",
           );
         }
         const args = request.params.arguments;
-        const taskId  = args.taskId;
+        const taskId = args.taskId;
         if (!taskId) {
           throw new McpError(
             ErrorCode.InvalidParams,
-            "The 'taskId' field is required."
+            "The 'taskId' field is required.",
           );
         }
         try {
@@ -262,7 +335,7 @@ class TasksServer {
             tasklist: "@default",
             task: taskId,
           });
-    
+
           return {
             content: [
               {
@@ -274,38 +347,36 @@ class TasksServer {
         } catch (error) {
           throw new McpError(
             ErrorCode.InternalError,
-            `Tasks API error: ${error}`
+            `Tasks API error: ${error}`,
           );
         }
       }
 
       if (request.params.name === "complete_task") {
-
         if (!isValidCreateTaskArgs(request.params.arguments)) {
           throw new McpError(
             ErrorCode.InvalidParams,
-            "Invalid arguments for creating a task. 'title' must be a string, and 'notes' must be a string or undefined."
+            "Invalid arguments for complete_task.",
           );
         }
         const args = request.params.arguments;
-        const taskId  = args.taskId;
-        const newStatus  = args.status;
-    
+        const taskId = args.taskId;
+        const newStatus = args.status;
+
         if (!taskId) {
           throw new McpError(
             ErrorCode.InvalidParams,
-            "The 'taskId' field is required."
+            "The 'taskId' field is required.",
           );
         }
-    
+
         try {
-          // Durumu güncelle
           const updateResponse = await tasks.tasks.patch({
             tasklist: "@default",
             task: taskId,
             requestBody: { status: newStatus },
           });
-    
+
           return {
             content: [
               {
@@ -317,17 +388,62 @@ class TasksServer {
         } catch (error) {
           throw new McpError(
             ErrorCode.InternalError,
-            `Tasks API error: ${error}`
+            `Tasks API error: ${error}`,
+          );
+        }
+      }
+
+      if (request.params.name === "update_task") {
+        if (!isValidUpdateTaskArgs(request.params.arguments)) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "Invalid arguments for update_task: taskId required; title, notes, due optional strings.",
+          );
+        }
+        const args = request.params.arguments;
+
+        const requestBody: Record<string, string> = {};
+        if (args.title !== undefined) requestBody.title = args.title;
+        if (args.notes !== undefined) requestBody.notes = args.notes;
+        if (args.due !== undefined) {
+          requestBody.due = args.due;
+        }
+
+        if (Object.keys(requestBody).length === 0) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "Provide at least one of title, notes, or due to update.",
+          );
+        }
+
+        try {
+          const updateResponse = await tasks.tasks.patch({
+            tasklist: "@default",
+            task: args.taskId,
+            requestBody,
+          });
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(updateResponse.data, null, 2),
+              },
+            ],
+          };
+        } catch (error) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `Tasks API error: ${error}`,
           );
         }
       }
 
       throw new McpError(
         ErrorCode.MethodNotFound,
-        `Unknown tool: ${request.params.name}`
+        `Unknown tool: ${request.params.name}`,
       );
     });
-
   }
 
   async run(): Promise<void> {
